@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 素材和成片不进版本库，只提交 recipe
+raw/
+out/
+*.mp4
+*.mov
+*.mkv
+*.timeline.json
