@@ -14,7 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import ffmpeg, pipeline, recipe as recipe_mod, srt
+from . import contactsheet, ffmpeg, library, pipeline, recipe as recipe_mod, srt
 from .errors import VeditError
 from .steps import available_steps
 from .timeline import Timeline, _fmt
@@ -122,6 +122,27 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="成片路径或 .timeline.json")
     p_srt.add_argument("-o", "--output", required=True, help="输出 SRT")
     p_srt.set_defaults(handler=cmd_retime)
+
+    p_scan = sub.add_parser("scan", help="扫描素材库：切镜头、评估画质、生成联系表")
+    p_scan.add_argument("root", help="素材目录（可以是外接盘上的路径）")
+    p_scan.add_argument("-i", "--index", default="index.json", help="索引输出路径")
+    p_scan.add_argument("-s", "--sheet", default="contactsheet.jpg", help="联系表输出路径")
+    p_scan.add_argument("--window", type=float, default=5.0, help="推荐入点的时长")
+    p_scan.add_argument("--columns", type=int, default=4)
+    p_scan.add_argument("--rows", type=int, default=5)
+    p_scan.add_argument("--no-sheet", action="store_true", help="只建索引，不出联系表")
+    p_scan.add_argument("--all", action="store_true",
+                        help="联系表包含有硬伤的镜头（默认只放可用的）")
+    p_scan.add_argument("--rescan", action="store_true", help="忽略已有索引，全部重新分析")
+    p_scan.set_defaults(handler=cmd_scan)
+
+    p_sheet = sub.add_parser("sheet", help="从已有索引重新生成联系表")
+    p_sheet.add_argument("-i", "--index", default="index.json")
+    p_sheet.add_argument("-s", "--sheet", default="contactsheet.jpg")
+    p_sheet.add_argument("--columns", type=int, default=4)
+    p_sheet.add_argument("--rows", type=int, default=5)
+    p_sheet.add_argument("--all", action="store_true")
+    p_sheet.set_defaults(handler=cmd_sheet)
 
     p_init = sub.add_parser("init", help="生成一份 recipe 模板")
     p_init.add_argument("name", help="流程名，会生成 <name>.yml")
@@ -237,4 +258,92 @@ def cmd_steps(args) -> int:
         summary = doc[0] if doc else ""
         print(f"  {name:<14} {summary}")
     print("\n每个步骤的完整参数见 README.md 或源码 vedit/steps/。")
+    return 0
+
+
+def cmd_scan(args) -> int:
+    root = Path(args.root).expanduser()
+    index_path = Path(args.index)
+
+    files = library.find_videos(root)
+    if not files:
+        print(f"{root} 里没有找到视频文件", file=sys.stderr)
+        return 1
+
+    # 增量：文件大小和修改时间都没变的，直接用上次的结果
+    cached: dict[str, library.LibraryEntry] = {}
+    if index_path.exists() and not args.rescan:
+        try:
+            cached = library.Library.load(index_path).index_by_path()
+            print(f"已有索引 {index_path}，未改动的素材会跳过")
+        except Exception:
+            cached = {}
+
+    print(f"扫描 {root}\n共 {len(files)} 个素材文件\n")
+
+    entries: list[library.LibraryEntry] = []
+    reused = 0
+    for n, path in enumerate(files, start=1):
+        stat = path.stat()
+        previous = cached.get(str(path))
+        if previous and previous.fingerprint == f"{stat.st_size}:{stat.st_mtime:.0f}":
+            entries.append(previous)
+            reused += 1
+            continue
+
+        print(f"[{n}/{len(files)}] {path.name}", flush=True)
+        try:
+            entry = library.analyze_file(path, window=args.window)
+        except VeditError as exc:
+            print(f"    跳过: {exc}", file=sys.stderr)
+            continue
+
+        entries.append(entry)
+        for shot in entry.shots:
+            warn = ("  ⚠ " + "/".join(shot.flags)) if shot.flags else ""
+            print(
+                f"    {shot.best_start:6.1f}s +{shot.best_length:.1f}s  "
+                f"{shot.motion_kind:<6s} {shot.score:5.1f}分{warn}"
+            )
+
+    lib = library.Library(root=str(root), entries=entries)
+    lib.save(index_path)
+
+    usable = lib.usable_shots()
+    print(
+        f"\n索引已写入 {index_path}"
+        f"\n  {len(entries)} 个文件（复用 {reused} 个）"
+        f"\n  {len(lib.all_shots)} 个镜头，其中 {len(usable)} 个可用"
+    )
+
+    if args.no_sheet:
+        return 0
+
+    shots = lib.all_shots if args.all else usable
+    if not shots:
+        print("没有可用镜头，联系表跳过", file=sys.stderr)
+        return 1
+
+    pages = contactsheet.build(
+        shots, Path(args.sheet), columns=args.columns, rows=args.rows
+    )
+    print("\n联系表:")
+    for page in pages:
+        size_kb = page.stat().st_size / 1024
+        print(f"  {page}  ({size_kb:.0f} KB)")
+    print("\n把这些图发给 Claude，就能按编号挑镜头了。")
+    return 0
+
+
+def cmd_sheet(args) -> int:
+    lib = library.Library.load(Path(args.index))
+    shots = lib.all_shots if args.all else lib.usable_shots()
+    if not shots:
+        print("索引里没有可用镜头", file=sys.stderr)
+        return 1
+    pages = contactsheet.build(
+        shots, Path(args.sheet), columns=args.columns, rows=args.rows
+    )
+    for page in pages:
+        print(f"  {page}")
     return 0
