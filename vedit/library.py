@@ -129,7 +129,37 @@ def find_videos(root: Path) -> list[Path]:
     return found
 
 
-def measure(path: Path, *, sample_fps: float = SAMPLE_FPS) -> list[FrameStat]:
+def detect_crop(path: Path, *, duration: float) -> str | None:
+    """检测素材是否带黑边（信箱式画幅），返回 crop 滤镜参数。
+
+    为什么必须做：带黑边的素材，暗部分位数完全被黑边主导，
+    曝光指标会一律判成「死黑」。实测中把带上下黑边的竖版素材
+    误判成死黑并排除，就是这个原因。
+    """
+    # 从中段取样，片头片尾常有黑场，会让 cropdetect 给出错误结果
+    seek = max(0.0, duration * 0.3)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin",
+        "-ss", f"{seek:.2f}", "-i", str(path),
+        "-vf", "cropdetect=limit=24:round=2:reset=0",
+        "-frames:v", "60", "-f", "null", "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    matches = re.findall(r"crop=(\d+:\d+:\d+:\d+)", proc.stderr)
+    if not matches:
+        return None
+
+    crop = matches[-1]
+    w, h, x, y = (int(v) for v in crop.split(":"))
+    # 只有裁掉的部分够多才算真有黑边，否则是 cropdetect 的正常抖动
+    if x <= 2 and y <= 2:
+        return None
+    return f"crop={crop}"
+
+
+def measure(
+    path: Path, *, sample_fps: float = SAMPLE_FPS, crop: str | None = None
+) -> list[FrameStat]:
     """一次解码，同时算出曝光、清晰度、运动量。
 
     三个指标各走一条滤镜分支，共用同一次解码 —— 对 4K 素材来说，
@@ -141,8 +171,9 @@ def measure(path: Path, *, sample_fps: float = SAMPLE_FPS) -> list[FrameStat]:
         f_shp = tmp / "sharp.txt"
         f_mot = tmp / "motion.txt"
 
+        prefix = f"{crop}," if crop else ""
         graph = (
-            f"[0:v]fps={sample_fps},scale={SAMPLE_WIDTH}:-2,format=gray,split=3[a][b][c];"
+            f"[0:v]{prefix}fps={sample_fps},scale={SAMPLE_WIDTH}:-2,format=gray,split=3[a][b][c];"
             f"[a]signalstats,metadata=print:file={f_exp}[o1];"
             f"[b]convolution=0m='0 -1 0 -1 4 -1 0 -1 0':0rdiv=1:0bias=0,"
             f"signalstats,metadata=print:file={f_shp}[o2];"
@@ -326,12 +357,14 @@ def evaluate(candidate: ShotCandidate, stats: list[FrameStat]) -> ShotCandidate:
         clipped_low = sum(1 for s in window if s.clipped_shadows) / len(window)
         candidate.luma = _mean(s.luma for s in window)
 
-        if clipped_high > 0.5:
-            flags.append("过曝")
-            score -= 20
-        if clipped_low > 0.5:
-            flags.append("死黑")
-            score -= 15
+        # 曝光只作提示，不作排除依据。这类片子里背景过曝成白
+        # 是刻意的高调手法，暗调场景压黑也是风格，都不是缺陷。
+        if clipped_high > 0.7:
+            flags.append("高光溢出")
+            score -= 8
+        if clipped_low > 0.7:
+            flags.append("暗部压实")
+            score -= 5
         if candidate.luma < 35:
             flags.append("偏暗")
             score -= 10
@@ -377,7 +410,10 @@ def analyze_file(path: Path, *, window: float = 5.0) -> LibraryEntry:
         entry.error = "没有视频流"
         return entry
 
-    stats = measure(path)
+    crop = detect_crop(path, duration=info.duration)
+    if crop:
+        entry.error = ""  # 有黑边不是错误，只是需要按内容区测量
+    stats = measure(path, crop=crop)
     for start, end in split_into_shots(path, info.duration):
         best_start, length, sharp, motion = pick_best_window(
             stats, start, end, length=window
@@ -411,7 +447,8 @@ class Library:
 
     def usable_shots(self, *, min_score: float = 0.0) -> list[ShotCandidate]:
         """排除有硬伤的镜头，按分数从高到低排序。"""
-        blocking = {"虚焦", "晃动", "过曝", "死黑"}
+        # 只有虚焦和晃动是客观缺陷。曝光和亮度是风格选择，交给眼睛判断。
+        blocking = {"虚焦", "晃动"}
         return sorted(
             (
                 s for s in self.all_shots
